@@ -9,7 +9,7 @@ DeepSeek-V4.1-Flash 技术报告。项目先实现可以在单机复现的部分
 
 报告描述的是一个异步 post-training 系统：限制 rollout 并发数，按 sample 和
 group 调度，在 `token`（模型词元）边界暂停生成，持久化 rollout 状态，屏蔽
-陈旧 token，并在 checkpoint 切换后恢复未完成的样本。本项目实现这些数据流
+陈旧 `token`，并在 checkpoint 切换后恢复未完成的样本。本项目实现这些数据流
 契约，但不声称复现 DeepSeek 的私有生产系统。
 
 ## 快速开始
@@ -29,7 +29,7 @@ python -m flashrl.cli inspect --run-dir runs/local-demo
 ## Flash 风格 ablation
 
 公开报告中的多项 post-training 和 serving 控制可以单独测量：有界 in-flight
-rollout、sample/group 调度、token 边界中断与恢复、陈旧 token 屏蔽、长度偏置
+rollout、sample/group 调度、`token` 边界中断与恢复、陈旧 `token` 屏蔽、长度偏置
 控制，以及 draft/target verification。项目提供 algorithm-level simulator，
 用同一批 workload 对比开启和关闭这些控制后的结果：
 
@@ -102,7 +102,7 @@ Prompt -> Rollout -> Reward/Verifier -> Experience -> Learner
    |---------------- checkpoint / policy_version ------------|
 ```
 
-每条 trajectory 都携带 `run_id`、`trajectory_id`、`group_id`、token ID、逐 token
+每条 trajectory 都携带 `run_id`、`trajectory_id`、`group_id`、`token` ID、逐个 `token`
 rollout logprob 和 `policy_version`。Derived experience 可以从原始 stage 重建。
 写入使用幂等 key，因此 at-least-once 重试不会重复样本。
 
@@ -111,7 +111,7 @@ rollout logprob 和 `policy_version`。Derived experience 可以从原始 stage 
 安装可选 HTTP 依赖并启动兼容的 SGLang server。`SGLangRolloutBackend` 通过
 `/generate` 发送 tokenized prompt 和 `return_logprob=true`，要求响应包含
 `output_token_logprobs`；只有文本的响应会被拒绝，因为文本无法安全恢复
-action-token 和 logprob 的对应关系。learner checkpoint 发布后，
+action `token` 和 logprob 的对应关系。learner checkpoint 发布后，
 `flashrl.sync.update_sglang_from_disk` 调用 `/update_weights_from_disk` 控制接口。
 
 通过多卡契约测试后，可以按以下顺序接入真实流程：
@@ -121,7 +121,7 @@ action-token 和 logprob 的对应关系。learner checkpoint 发布后，
 3. 将 `ToyLearner` 替换为 GRPO/PPO learner，并保留相同 schemas；
 4. 为每个 rollout shard 运行一个 SGLang endpoint，再加入有界异步 worker
    和 checkpoint-version admission rules；
-5. 测量 rollout 利用率、队列延迟、陈旧 token 比例、reward、loss、accepted
+5. 测量 rollout 利用率、队列延迟、陈旧 `token` 比例、reward、loss、accepted
    length 和端到端 step time。
 
 ## 范围边界
