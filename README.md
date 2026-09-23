@@ -1,5 +1,7 @@
 # FlashRL Infra
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 FlashRL is a small, runnable RL data plane inspired by the public
 DeepSeek-V4.1-Flash report. It focuses on the part that can be reproduced on a
 single workstation first, then scales the same contracts across torchrun
