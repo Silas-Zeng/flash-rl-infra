@@ -66,24 +66,38 @@ class SGLangRolloutBackend:
         payload = {
             "model": self.model,
             "input_ids": prompt.input_ids,
-            "max_tokens": 128,
-            "temperature": 1.0,
-            "seed": prompt.seed,
+            "sampling_params": {"max_new_tokens": 128, "temperature": 1.0, "seed": prompt.seed},
             "return_logprob": True,
             "metadata": {"run_id": prompt.run_id, "prompt_id": prompt.prompt_id, "group_id": prompt.group_id},
         }
-        response = httpx.post(f"{self.base_url}/v1/completions", json=payload, timeout=self.timeout)
+        response = httpx.post(f"{self.base_url}/generate", json=payload, timeout=self.timeout)
         response.raise_for_status()
         body: dict[str, Any] = response.json()
-        choice = body["choices"][0]
         meta = body.get("meta_info", {})
         pairs = meta.get("output_token_logprobs") or []
+        if not isinstance(pairs, list) or any(not isinstance(pair, (list, tuple)) or len(pair) != 2 for pair in pairs):
+            raise RuntimeError("SGLang response contains malformed output_token_logprobs")
         response_ids = [int(pair[1]) for pair in pairs]
         logprobs = [float(pair[0]) for pair in pairs]
         if not response_ids:
-            text = choice.get("text", "")
             raise RuntimeError("SGLang response did not expose output_token_logprobs; text-only data is unsafe for RL")
-        policy_version = int(meta.get("weight_version", prompt.policy_version))
+        completion_tokens = meta.get("completion_tokens")
+        if completion_tokens is not None and int(completion_tokens) != len(response_ids):
+            raise RuntimeError("SGLang completion token count does not match output_token_logprobs")
+        finish_reason = meta.get("finish_reason", "length")
+        if isinstance(finish_reason, dict):
+            finish_reason = finish_reason.get("type", "length")
+        raw_version = meta.get("weight_version")
+        if raw_version is None:
+            policy_version = prompt.policy_version
+        else:
+            try:
+                policy_version = int(raw_version)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "SGLang weight_version must be a numeric policy step; "
+                    "pass a monotonic training version when publishing weights"
+                ) from exc
         trajectory = Trajectory(
             run_id=prompt.run_id,
             trajectory_id=trajectory_id,
@@ -92,7 +106,7 @@ class SGLangRolloutBackend:
             prompt_ids=prompt.input_ids,
             response_ids=response_ids,
             rollout_logprobs=logprobs,
-            finish_reason=choice.get("finish_reason", "stop"),
+            finish_reason=str(finish_reason),
             policy_version=policy_version,
             generated_tokens=len(response_ids),
             wall_time_ms=(time.perf_counter() - started) * 1000,

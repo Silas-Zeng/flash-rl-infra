@@ -40,6 +40,7 @@ def main() -> int:
     parser.add_argument("--groups", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=2)
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--optimizer-mode", choices=["adamw", "flash_reference"], default="adamw")
     args = parser.parse_args()
     if args.nproc < 1:
         raise ValueError("--nproc must be positive")
@@ -54,6 +55,7 @@ def main() -> int:
         "groups": args.groups,
         "group_size": args.group_size,
         "steps": args.steps,
+        "optimizer_mode": args.optimizer_mode,
     }
     try:
         mp.spawn(_worker, args=(args.nproc, init_method, kwargs), nprocs=args.nproc, join=True)

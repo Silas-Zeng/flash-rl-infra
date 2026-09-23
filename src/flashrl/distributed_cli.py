@@ -20,6 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--vocab-size", type=int, default=32)
     run.add_argument("--hidden-size", type=int, default=64)
     run.add_argument("--learning-rate", type=float, default=0.05)
+    run.add_argument("--optimizer-mode", choices=["adamw", "flash_reference"], default="adamw")
     run.add_argument("--seed", type=int, default=20260923)
     run.add_argument("--backend", choices=["auto", "gloo", "nccl"], default="auto")
     compare = sub.add_parser("ablation", help="compare baseline with Flash-style algorithmic tricks")
@@ -50,6 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             vocab_size=args.vocab_size,
             hidden_size=args.hidden_size,
             learning_rate=args.learning_rate,
+            optimizer_mode=args.optimizer_mode,
             seed=args.seed,
             backend=args.backend,
         )

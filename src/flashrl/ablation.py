@@ -176,6 +176,12 @@ def compare_modes(*, samples: int = 64, seed: int = 20260923, output: str | Path
         attention = {"available": True, **run_attention_smoke()}
     except ImportError as exc:
         attention = {"available": False, "reason": str(exc)}
+    try:
+        from .optim import run_optimizer_smoke
+
+        optimizers = {"available": True, **run_optimizer_smoke()}
+    except ImportError as exc:
+        optimizers = {"available": False, "reason": str(exc)}
     result = {
         "baseline": baseline,
         "flash": flash,
@@ -183,6 +189,7 @@ def compare_modes(*, samples: int = 64, seed: int = 20260923, output: str | Path
         "compression": compression,
         "mtp": mtp,
         "attention": attention,
+        "optimizers": optimizers,
         "coverage_limits": [
             {"feature": "native_fp4_cuda_kernel", "status": "not_available", "reason": "requires vendor kernel and compatible GPU"},
             {"feature": "trained_csa2_architecture", "status": "not_available", "reason": "requires the trained model and checkpoint"},

@@ -17,6 +17,7 @@ from flashrl.compression import (
 )
 from flashrl.speculative import MTPHead, verify_candidates
 from flashrl.attention import CSA2Mode, CSA2Reference, CEDPlan, CEDReference
+from flashrl.optim import run_optimizer_smoke
 
 
 def test_single_process_distributed_contract(tmp_path: Path):
@@ -50,6 +51,19 @@ def test_single_process_distributed_contract(tmp_path: Path):
         interrupted=record["interrupted"],
     )
     assert trajectory.generated_tokens == 2
+
+
+def test_distributed_reference_optimizer_mode(tmp_path: Path):
+    summary = run_distributed(
+        tmp_path / "distributed-optim",
+        groups=1,
+        group_size=2,
+        steps=1,
+        max_tokens=2,
+        optimizer_mode="flash_reference",
+    )
+    assert summary is not None
+    assert summary["optimizer_mode"] == "flash_reference"
 
 
 def test_ablation_compares_the_same_workload(tmp_path: Path):
@@ -119,4 +133,11 @@ def test_csa2_modes_and_ced_projection():
         torch.randn(5, 8), [torch.randn(8, 8) for _ in range(2)], [torch.randn(8, 8) for _ in range(2)]
     )
     assert len(keys) == len(values) == 2
+
+
+def test_reference_optimizer_groups_update_finitely():
+    result = run_optimizer_smoke()
+    assert result["updated"] is True
+    assert result["optimizers"] == ["adamw", "head_wise_muon", "sinkhorn_momentum"]
+    assert result["loss_after"] < result["loss_before"]
 

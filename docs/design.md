@@ -34,8 +34,9 @@ The rollout adapter must return response token IDs and one sampled-token logprob
 per response token. It must also report the policy/weight version that actually
 served the request. The learner should reject or mask tokens that exceed the
 configured staleness budget. Weight publication must be atomic from the
-rollout worker's perspective: pause, update, flush/rebuild cache, verify the
-new version, then resume.
+rollout worker's perspective: abort active requests, update with an explicit
+numeric `weight_version`, flush/rebuild cache, verify the new version, then
+resume.
 
 ## Multi-GPU contract
 
@@ -48,8 +49,9 @@ after the DDP update and a barrier.
 
 For each batch, local rewards and counts are reduced per group. The resulting
 group baseline is used to calculate the advantage before the DDP backward pass.
-This gives the learner a real cross-rank collective without requiring a large
-model or a model download. The tiny actor is replaceable: a production actor
+The loss is scaled by the global sample count so uneven rank shards still
+match a global-mean update. This gives the learner a real cross-rank collective
+without requiring a large model or a model download. The tiny actor is replaceable: a production actor
 can keep the same `prompt_ids`, `response_ids`, `old_logprobs`,
 `policy_version`, and `stale_tokens` fields while the rollout implementation
 calls SGLang.

@@ -145,6 +145,7 @@ def run_distributed(
     vocab_size: int = 32,
     hidden_size: int = 64,
     learning_rate: float = 0.05,
+    optimizer_mode: str = "adamw",
     seed: int = 20260923,
     backend: str = "auto",
     init_method: str | None = None,
@@ -158,6 +159,8 @@ def run_distributed(
 
     if groups < 1 or group_size < 1 or steps < 1:
         raise ValueError("groups, group_size and steps must be positive")
+    if optimizer_mode not in {"adamw", "flash_reference"}:
+        raise ValueError("optimizer_mode must be 'adamw' or 'flash_reference'")
     env = init_distributed(backend, init_method=init_method)
     output_path = Path(output)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -174,7 +177,17 @@ def run_distributed(
         if env.world_size > 1
         else actor
     )
-    optimizer = torch.optim.Adam(ddp_actor.parameters(), lr=learning_rate)
+    if optimizer_mode == "adamw":
+        optimizers = {"adamw": torch.optim.AdamW(ddp_actor.parameters(), lr=learning_rate)}
+    else:
+        # The reference grouping operates on the underlying actor and updates
+        # the same parameters wrapped by DDP.  It is intentionally opt-in:
+        # production runs should replace it with a fused implementation.
+        from .optim import build_flash_optimizers
+
+        optimizers = build_flash_optimizers(actor.named_parameters(), lr=learning_rate)
+        if not optimizers:
+            raise RuntimeError("flash_reference produced no trainable parameter groups")
     policy_version = 0
     rank_rollout_path = output_path / "rollouts" / f"rank-{env.rank:04d}.jsonl"
     local_reward_sum = 0.0
@@ -231,7 +244,8 @@ def run_distributed(
                 )
 
         baselines = _reduce_group_baselines(env, group_sums, group_counts)
-        optimizer.zero_grad(set_to_none=True)
+        for optimizer in optimizers.values():
+            optimizer.zero_grad(set_to_none=True)
         losses: list[torch.Tensor] = []
         for record in pending:
             advantage = float(record["reward"] - baselines[record["group_index"]].item())
@@ -248,13 +262,22 @@ def run_distributed(
             _jsonl_append(rank_rollout_path, record)
             local_reward_sum += float(record["reward"])
             local_sample_count += 1
+        batch_count = torch.tensor([float(len(losses))], dtype=torch.float64, device=env.device)
+        if env.world_size > 1:
+            dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
+        global_batch_count = max(float(batch_count.item()), 1.0)
         if losses:
-            torch.stack(losses).mean().backward()
+            # DDP averages gradients across ranks. Weight the local sum by
+            # world_size/global_count so uneven rank shards still produce the
+            # same gradient as one global mean batch.
+            scale = env.world_size / global_batch_count if env.world_size > 1 else 1.0 / global_batch_count
+            torch.stack(losses).sum().mul_(scale).backward()
         else:
             # This happens only when there are more ranks than samples.  A
             # zero loss still participates in DDP's collective graph.
             (ddp_actor(torch.zeros((1, 1), dtype=torch.long, device=env.device)).sum() * 0.0).backward()
-        optimizer.step()
+        for optimizer in optimizers.values():
+            optimizer.step()
 
         version_tensor = torch.tensor([policy_version + 1 if env.rank == 0 else 0], dtype=torch.long, device=env.device)
         if env.world_size > 1:
@@ -267,7 +290,8 @@ def run_distributed(
             torch.save(
                 {
                     "model": actor.state_dict(),
-                    "optimizer": optimizer.state_dict(),
+                    "optimizer_mode": optimizer_mode,
+                    "optimizers": {name: optimizer.state_dict() for name, optimizer in optimizers.items()},
                     "policy_version": policy_version,
                     "step": step + 1,
                     "vocab_size": vocab_size,
@@ -305,6 +329,7 @@ def run_distributed(
             "samples": int(reward_stats[1].item()),
             "mean_reward": float(reward_stats[0].item() / max(reward_stats[1].item(), 1.0)),
             "policy_version": policy_version,
+            "optimizer_mode": optimizer_mode,
         }
         (output_path / "run_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     if env.world_size > 1:

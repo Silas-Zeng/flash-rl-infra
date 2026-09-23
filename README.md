@@ -53,9 +53,14 @@ Compression and coverage details are in
 [docs/coverage.md](docs/coverage.md). The ablation JSON also includes a
 runnable reference report for FP16, INT8, FP4-style packed KV, cross-layer
 references, tiered KV, Engram sharding, INT8 gradient payloads, and bounded KV
-replay. It does not claim to be a native DeepSeek kernel or trained model.
-It also runs a small MTP-head training loss and confidence verification smoke
-test, plus a dense CED/CSA2 Full-Reindex-Reuse reference smoke test.
+replay with versioned payload snapshots. It does not claim to be a native
+DeepSeek kernel or trained model.
+It also runs a small MTP-head training update and standard speculative
+acceptance (`min(1, p/q)`, residual correction, and bonus-token) smoke test,
+plus a dense CED/CSA2 Full-Reindex-Reuse reference smoke test.
+The report also runs a finite-step smoke for the reference head-wise Muon and
+Sinkhorn-balanced parameter groups. These are inspectable PyTorch updates, not
+the fused kernels used by a production pre-training run.
 
 ## Multi-GPU first path
 
@@ -77,6 +82,10 @@ torchrun --standalone --nproc_per_node 2 -m flashrl.distributed_cli run `
   --output runs/multigpu --groups 4 --group-size 2 --steps 2
 Get-Content runs/multigpu/run_summary.json
 ```
+
+To exercise the reference optimizer grouping in the same multi-rank loop, add
+`--optimizer-mode flash_reference`. The default `adamw` path is the stable
+baseline used by the smoke command.
 
 The checked-in helpers are `scripts/run_multigpu.ps1` and
 `scripts/run_multigpu.sh`. On rented NVIDIA machines, use

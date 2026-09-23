@@ -8,10 +8,18 @@ cache, sharded Engram metadata, and bounded approximate replay.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
+import json
 import math
+import os
+import pickle
+import random
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -232,20 +240,76 @@ class Int8GradientCompressor:
 class BoundedKVReplay:
     """Bounded approximate replay metadata for interrupted KV states."""
 
-    def __init__(self, max_tokens: int = 1024) -> None:
+    _PAYLOAD_VERSION = 1
+
+    def __init__(
+        self,
+        max_tokens: int = 1024,
+        *,
+        seed: int | None = None,
+        rng: random.Random | None = None,
+    ) -> None:
         if max_tokens < 1:
             raise ValueError("max_tokens must be positive")
+        if rng is not None and not isinstance(rng, random.Random):
+            raise TypeError("rng must be an instance of random.Random")
         self.max_tokens = max_tokens
         self._states: OrderedDict[tuple[str, int], dict[str, Any]] = OrderedDict()
         self.evictions = 0
+        self._rng = rng if rng is not None else random.Random(seed)
 
-    def append(self, sample_id: str, token_index: int, *, policy_version: int, kv_bytes: int) -> None:
+    @property
+    def rng(self) -> random.Random:
+        """The replay RNG, exposed for deterministic scheduler integration."""
+
+        return self._rng
+
+    def append(
+        self,
+        sample_id: str,
+        token_index: int,
+        *,
+        policy_version: int,
+        kv_bytes: int,
+        payload: Any = None,
+    ) -> None:
+        """Append one token state, optionally retaining its replay payload.
+
+        Payloads are deliberately opaque to the replay container.  They may be
+        JSON-compatible metadata, bytes, or tensors.  Persistence encodes the
+        payload without changing the in-memory object, and restoring creates a
+        detached copy for tensor payloads.
+        """
+
+        if not isinstance(sample_id, str) or not sample_id:
+            raise ValueError("sample_id must be a non-empty string")
+        if token_index < 0:
+            raise ValueError("token_index must be non-negative")
+        if policy_version < 0:
+            raise ValueError("policy_version must be non-negative")
+        if kv_bytes < 0:
+            raise ValueError("kv_bytes must be non-negative")
         key = (sample_id, token_index)
-        self._states[key] = {"policy_version": policy_version, "kv_bytes": kv_bytes}
+        self._states[key] = {
+            "policy_version": int(policy_version),
+            "kv_bytes": int(kv_bytes),
+            "payload": payload,
+        }
         self._states.move_to_end(key)
         while len(self._states) > self.max_tokens:
             self._states.popitem(last=False)
             self.evictions += 1
+
+    def get(self, sample_id: str, token_index: int) -> dict[str, Any] | None:
+        """Return a replay state without exposing the internal mapping."""
+
+        state = self._states.get((sample_id, token_index))
+        return None if state is None else dict(state)
+
+    def items(self) -> list[tuple[tuple[str, int], dict[str, Any]]]:
+        """Return states in eviction order as a detached list."""
+
+        return [(key, dict(state)) for key, state in self._states.items()]
 
     @property
     def tokens(self) -> int:
@@ -254,6 +318,179 @@ class BoundedKVReplay:
     @property
     def retained_bytes(self) -> int:
         return sum(int(state["kv_bytes"]) for state in self._states.values())
+
+    @staticmethod
+    def _encode_value(value: Any) -> Any:
+        """Encode common payload values into a JSON-safe representation."""
+
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, bytes):
+            return {
+                "__flashrl_type__": "bytes",
+                "data": base64.b64encode(value).decode("ascii"),
+            }
+        if isinstance(value, bytearray):
+            return {
+                "__flashrl_type__": "bytes",
+                "data": base64.b64encode(bytes(value)).decode("ascii"),
+            }
+        if isinstance(value, tuple):
+            return {
+                "__flashrl_type__": "tuple",
+                "items": [BoundedKVReplay._encode_value(item) for item in value],
+            }
+        if isinstance(value, list):
+            return [BoundedKVReplay._encode_value(item) for item in value]
+        if isinstance(value, dict):
+            if all(isinstance(key, str) for key in value):
+                return {key: BoundedKVReplay._encode_value(item) for key, item in value.items()}
+        if torch.is_tensor(value):
+            buffer = io.BytesIO()
+            torch.save(value.detach().cpu(), buffer)
+            return {
+                "__flashrl_type__": "torch_tensor",
+                "data": base64.b64encode(buffer.getvalue()).decode("ascii"),
+            }
+
+        # A replay payload may be an application-specific object.  Keep the
+        # on-disk format JSON while retaining a useful round-trip for local
+        # checkpoints.  Restore is intentionally for checkpoints created by
+        # this process, rather than an untrusted input format.
+        encoded = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        return {
+            "__flashrl_type__": "pickle",
+            "data": base64.b64encode(encoded).decode("ascii"),
+        }
+
+    @staticmethod
+    def _decode_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return [BoundedKVReplay._decode_value(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        value_type = value.get("__flashrl_type__")
+        if value_type == "bytes":
+            return base64.b64decode(value["data"])
+        if value_type == "tuple":
+            return tuple(BoundedKVReplay._decode_value(item) for item in value["items"])
+        if value_type == "torch_tensor":
+            buffer = io.BytesIO(base64.b64decode(value["data"]))
+            try:
+                return torch.load(buffer, map_location="cpu", weights_only=True)
+            except TypeError:  # pragma: no cover - older torch fallback
+                buffer.seek(0)
+                return torch.load(buffer, map_location="cpu")
+        if value_type == "pickle":
+            return pickle.loads(base64.b64decode(value["data"]))
+        return {key: BoundedKVReplay._decode_value(item) for key, item in value.items()}
+
+    @staticmethod
+    def _encode_rng_state(state: object) -> str:
+        return base64.b64encode(pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)).decode("ascii")
+
+    @staticmethod
+    def _decode_rng_state(value: str) -> object:
+        return pickle.loads(base64.b64decode(value))
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return a versioned, JSON-safe snapshot of the replay."""
+
+        states = []
+        for (sample_id, token_index), state in self._states.items():
+            states.append(
+                {
+                    "sample_id": sample_id,
+                    "token_index": token_index,
+                    "policy_version": int(state["policy_version"]),
+                    "kv_bytes": int(state["kv_bytes"]),
+                    "payload": self._encode_value(state.get("payload")),
+                }
+            )
+        return {
+            "format": "flashrl.bounded_kv_replay",
+            "version": self._PAYLOAD_VERSION,
+            "max_tokens": self.max_tokens,
+            "evictions": self.evictions,
+            "states": states,
+            "rng_state": self._encode_rng_state(self._rng.getstate()),
+        }
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        """Alias for :meth:`to_payload` useful to checkpoint writers."""
+
+        return self.to_payload()
+
+    state_dict = to_payload
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "BoundedKVReplay":
+        """Restore a replay from :meth:`to_payload` output."""
+
+        if not isinstance(payload, dict):
+            raise TypeError("replay payload must be a mapping")
+        if payload.get("format") != "flashrl.bounded_kv_replay":
+            raise ValueError("invalid bounded KV replay format")
+        if payload.get("version") != cls._PAYLOAD_VERSION:
+            raise ValueError(f"unsupported bounded KV replay version: {payload.get('version')!r}")
+        replay = cls(int(payload["max_tokens"]))
+        replay.evictions = int(payload.get("evictions", 0))
+        if replay.evictions < 0:
+            raise ValueError("replay evictions must be non-negative")
+        states = payload.get("states", [])
+        if not isinstance(states, list) or len(states) > replay.max_tokens:
+            raise ValueError("replay states exceed max_tokens")
+        for state in states:
+            if not isinstance(state, dict):
+                raise ValueError("replay state must be a mapping")
+            replay.append(
+                str(state["sample_id"]),
+                int(state["token_index"]),
+                policy_version=int(state["policy_version"]),
+                kv_bytes=int(state["kv_bytes"]),
+                payload=cls._decode_value(state.get("payload")),
+            )
+        # Appending cannot evict because the snapshot is bounded.  Restore the
+        # original counter after rebuilding to preserve observability.
+        replay.evictions = int(payload.get("evictions", 0))
+        rng_state = payload.get("rng_state")
+        if rng_state is not None:
+            replay._rng.setstate(cls._decode_rng_state(rng_state))
+        return replay
+
+    from_state_dict = from_payload
+
+    def persist(self, path: str | Path) -> Path:
+        """Atomically persist a replay snapshot as UTF-8 JSON."""
+
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f"{target.name}.", suffix=".tmp", dir=target.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self.to_payload(), handle, ensure_ascii=False, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return target
+
+    @classmethod
+    def restore(cls, path: str | Path) -> "BoundedKVReplay":
+        """Restore a replay snapshot written by :meth:`persist`."""
+
+        source = Path(path)
+        with source.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return cls.from_payload(payload)
+
+    # Explicit aliases make checkpoint integration readable without coupling
+    # callers to the JSON implementation details.
+    snapshot = to_payload
+    load = restore
 
 
 def run_compression_benchmark(
