@@ -2,16 +2,15 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-FlashRL 是一个可运行的强化学习数据平面，参考了公开的
-DeepSeek-V4.1-Flash 技术报告。项目优先实现可以在单机复现的部分，再用
-torchrun 将相同的数据契约扩展到多卡：有界 rollout、奖励与 verifier、可
-回放记录、带版本陈旧度的 experience、同步 learner 更新以及 checkpoint
-发布。
+FlashRL 是一个可运行的强化学习（RL）数据平面，参考公开的
+DeepSeek-V4.1-Flash 技术报告。项目先实现可以在单机复现的部分，再用
+`torchrun` 将相同的数据契约扩展到多卡：有界 rollout、奖励与验证器、可回放
+的记录、带策略版本的 experience、同步 learner 更新，以及 checkpoint 发布。
 
-报告描述的是一个异步 post-training 系统：限制 rollout 并发数，按 sample
-和 group 调度，在 token 边界暂停生成，持久化 rollout 状态，屏蔽陈旧 token，
-并在 checkpoint 切换后恢复未完成样本。本项目实现这些数据流契约，但不声称
-复现 DeepSeek 的私有生产系统。
+报告描述的是一个异步 post-training 系统：限制 rollout 并发数，按 sample 和
+group 调度，在 `token`（模型词元）边界暂停生成，持久化 rollout 状态，屏蔽
+陈旧 token，并在 checkpoint 切换后恢复未完成的样本。本项目实现这些数据流
+契约，但不声称复现 DeepSeek 的私有生产系统。
 
 ## 快速开始
 
@@ -32,7 +31,7 @@ python -m flashrl.cli inspect --run-dir runs/local-demo
 公开报告中的多项 post-training 和 serving 控制可以单独测量：有界 in-flight
 rollout、sample/group 调度、token 边界中断与恢复、陈旧 token 屏蔽、长度偏置
 控制，以及 draft/target verification。项目提供 algorithm-level simulator，
-用同一批 workload 对比开启和关闭这些控制的结果：
+用同一批 workload 对比开启和关闭这些控制后的结果：
 
 ```powershell
 python -m flashrl.cli ablation --samples 128 --output runs/ablation/comparison.json
@@ -42,7 +41,7 @@ python -m flashrl.cli ablation --samples 128 --output runs/ablation/comparison.j
 `virtual_tokens_per_cost_unit`、`acceptance_rate`、`target_forward_reduction`、
 `max_inflight_observed`、`stale_token_ratio`、`mean_reward`、`mean_task_reward`
 和 `length_reward_correlation`，并给出 delta。virtual decode cost 是与模型
-无关的算法成本单位，用来检查方向是否正确；真实 GPU 吞吐仍需租用 GPU 测量。
+无关的算法成本单位，用来检查算法方向；真实 GPU 吞吐仍需租用 GPU 测量。
 相同对比也可以通过 `python -m flashrl.distributed_cli ablation` 运行。
 
 压缩和覆盖范围见 [docs/coverage.md](docs/coverage.md)。ablation JSON 还会输出
@@ -50,7 +49,7 @@ FP16、INT8、FP4-style packed KV、跨层引用、分层 KV、Engram 分片、I
 payload，以及带版本化 payload snapshot 的有界 KV replay 参考结果。它不声称
 实现原生 DeepSeek kernel 或训练好的 DeepSeek 模型。
 
-它还会运行 MTP head 的一步训练更新、标准 speculative acceptance
+报告还会运行 MTP head 的一步训练更新、标准 speculative acceptance
 （`min(1, p/q)`、残差修正和 bonus token）smoke test，以及 CED/CSA2
 Full-Reindex-Reuse 的 dense reference smoke test。报告同时包含 head-wise Muon
 和 Sinkhorn-balanced 参数分组的一步 smoke；这些是便于检查的 PyTorch 更新，
@@ -61,7 +60,7 @@ Full-Reindex-Reuse 的 dense reference smoke test。报告同时包含 head-wise
 分布式原型保持很小，但在租用 GPU 前验证了关键边界：
 
 - 每个 rank 获得确定性的 trajectory ID 分片，重试不会产生重复样本；
-- 在 policy update 前按 GRPO 风格 group 做 reward reduction；
+- 在 policy update 前按 GRPO 风格的 group 做 reward reduction；
 - DDP 同步梯度，rank 0 发布带版本的 checkpoint；
 - 每个 rank 写入自己的不可变 rollout JSONL 分片；
 - run summary 记录 world size、backend、policy version 和 mean reward。
