@@ -1,6 +1,5 @@
 # FlashRL Infra
 
-[English](README.md) | [简体中文](README.zh-CN.md)
 
 FlashRL is a small, runnable RL data plane inspired by the public
 DeepSeek-V4.1-Flash report. It first focuses on the pieces that can be
